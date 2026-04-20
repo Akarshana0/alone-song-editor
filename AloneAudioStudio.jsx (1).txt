@@ -1,0 +1,1200 @@
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════╗
+ * ║       ALONE AUDIO STUDIO  ·  v2.0  (Steps 2 + 3)                           ║
+ * ║                                                                              ║
+ * ║  Audio Engine Architecture:                                                  ║
+ * ║                                                                              ║
+ * ║  [Dropped File / URL]                                                        ║
+ * ║        │                                                                     ║
+ * ║        ├──► WaveSurfer.js ──► renders real waveform + cursor                ║
+ * ║        │                                                                     ║
+ * ║        └──► Tone.Player ──► Tone.EQ10 ──► Tone.Volume ──► Tone.Destination ║
+ * ║                                  ▲               ▲                           ║
+ * ║                           EQ Panel (10-band)  Volume slider                 ║
+ * ║                                                                              ║
+ * ║  Both WaveSurfer and Tone share the same AudioContext.                       ║
+ * ║  WaveSurfer is visuals-only — Tone owns ALL playback.                        ║
+ * ╚══════════════════════════════════════════════════════════════════════════════╝
+ *
+ *  In Next.js install:
+ *    npm install wavesurfer.js tone framer-motion
+ *
+ *  In the React Artifact we load WaveSurfer + Tone via CDN automatically.
+ */
+
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+// ─── CDN loader (artifact sandbox) ───────────────────────────────────────────
+// In a real Next.js app, replace this with:
+//   import WaveSurfer from "wavesurfer.js";
+//   import * as Tone from "tone";
+function useCDNLibs() {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const load = (src) =>
+      new Promise((res, rej) => {
+        if (document.querySelector(`script[src="${src}"]`)) { res(); return; }
+        const s = document.createElement("script");
+        s.src = src; s.async = true;
+        s.onload = res; s.onerror = rej;
+        document.head.appendChild(s);
+      });
+    Promise.all([
+      load("https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"),
+      load("https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"),
+    ])
+      .then(() => setReady(true))
+      .catch((e) => console.error("CDN load failed:", e));
+  }, []);
+  return ready;
+}
+
+// ─── Design tokens ────────────────────────────────────────────────────────────
+const C = {
+  bg:        "#04040a",
+  bgPanel:   "#080810",
+  bgHover:   "#111124",
+  border:    "#1a1a30",
+  cyan:      "#00f3ff",
+  cyanDim:   "#00a8b5",
+  pink:      "#ff003c",
+  purple:    "#9d00ff",
+  yellow:    "#f5e642",
+  text:      "#c8d8e8",
+  textDim:   "#4a5a6a",
+  textBright:"#e8f4ff",
+};
+const rgb = (hex) => {
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return `${r},${g},${b}`;
+};
+
+// ─── dB helpers ───────────────────────────────────────────────────────────────
+const volToDb = (v) => (v <= 0 ? -Infinity : 20 * Math.log10(v / 100));
+
+// ─── Tone node registry (lives outside React state) ──────────────────────────
+// Shape per trackId: { player: Tone.Player, eq10: Tone.EQ10, vol: Tone.Volume, meter: Tone.Meter }
+const NODES = new Map();
+
+function buildChain(trackId) {
+  if (!window.Tone) return null;
+  teardown(trackId);
+  const T = window.Tone;
+  const eq10 = new T.EQ10({
+    32:0, 64:0, 125:0, 250:0, 500:0,
+    "1000":0,"2000":0,"4000":0,"8000":0,"16000":0,
+  });
+  const vol   = new T.Volume(0);
+  const meter = new T.Meter({ normalRange:true, smoothing:0.8 });
+  eq10.chain(vol, meter, T.getDestination());
+  const player = new T.Player({ loop:false }).connect(eq10);
+  NODES.set(trackId, { player, eq10, vol, meter });
+  return NODES.get(trackId);
+}
+
+function teardown(trackId) {
+  const n = NODES.get(trackId);
+  if (!n) return;
+  try { n.player.stop(); n.player.dispose(); n.eq10.dispose(); n.vol.dispose(); n.meter.dispose(); } catch {}
+  NODES.delete(trackId);
+}
+
+function getNodes(id) { return NODES.get(id); }
+
+// ─── Track factory ────────────────────────────────────────────────────────────
+let _idSeed = 1;
+const TRACK_COLORS = [C.cyan, C.pink, C.purple, C.yellow, C.cyanDim];
+
+function makeTrack(overrides = {}) {
+  const id = _idSeed++;
+  return {
+    id,
+    name:     `TRACK ${id}`,
+    color:    TRACK_COLORS[(id - 1) % TRACK_COLORS.length],
+    muted:    false,
+    solo:     false,
+    armed:    false,
+    volume:   80,
+    loaded:   false,
+    duration: 0,
+    fileName: "",
+    eq: [0,0,0,0,0,0,0,0,0,0],   // per-band dB gains
+    ...overrides,
+  };
+}
+
+// ─── Shared pending-file map (main drop → TrackRow) ───────────────────────────
+// When a file is dropped on the global zone we create the track *then* hand
+// the File object here; TrackRow reads it on first render.
+const PENDING = new Map();
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  UI ATOMS
+// ══════════════════════════════════════════════════════════════════════════════
+
+function CyberButton({ children, active, color = C.cyan, onClick, small = false,
+                       danger = false, disabled = false, className = "" }) {
+  const col = danger ? C.pink : color;
+  return (
+    <motion.button
+      onClick={disabled ? undefined : onClick}
+      whileHover={disabled ? {} : { scale:1.04 }}
+      whileTap={disabled ? {} : { scale:0.95 }}
+      className={`relative overflow-hidden font-mono tracking-widest uppercase select-none ${className}`}
+      style={{
+        padding: small ? "4px 10px" : "7px 18px",
+        fontSize: small ? "9px" : "10px",
+        border: `1px solid ${active && !disabled ? col : C.border}`,
+        background: active && !disabled ? `rgba(${rgb(col)},0.12)` : "transparent",
+        color: disabled ? C.textDim : active ? col : C.textDim,
+        boxShadow: active && !disabled ? `0 0 12px rgba(${rgb(col)},0.3)` : "none",
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.45 : 1,
+        transition: "all 0.15s ease",
+      }}>
+      {active && !disabled && (
+        <div className="absolute inset-0 pointer-events-none"
+          style={{ background:`linear-gradient(135deg,rgba(${rgb(col)},0.08),transparent 60%)` }}/>
+      )}
+      {children}
+    </motion.button>
+  );
+}
+
+function NeonSlider({ value, onChange, min=0, max=100, step=1, color=C.cyan, vertical=false }) {
+  const pct = Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+  return (
+    <div style={{ width: vertical ? 20 : "100%", height: vertical ? 80 : 20,
+                  display:"flex", alignItems:"center" }}>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{
+          WebkitAppearance:"none", appearance:"none",
+          width: vertical ? 80 : "100%", height:4,
+          transform: vertical ? "rotate(-90deg)" : "none",
+          transformOrigin: vertical ? "40px 40px" : "initial",
+          background:`linear-gradient(to right,${color} ${pct}%,${C.border} ${pct}%)`,
+          outline:"none", border:"none", cursor:"pointer",
+        }}/>
+    </div>
+  );
+}
+
+function CornerDeco({ pos }) {
+  const b = pos.includes("bottom"), r = pos.includes("right");
+  return (
+    <div style={{ position:"absolute",[b?"bottom":"top"]:0,[r?"right":"left"]:0,
+                  width:14,height:14,pointerEvents:"none" }}>
+      <div style={{ position:"absolute",[b?"bottom":"top"]:0,[r?"right":"left"]:0,width:8,height:1,background:C.cyan }}/>
+      <div style={{ position:"absolute",[b?"bottom":"top"]:0,[r?"right":"left"]:0,width:1,height:8,background:C.cyan }}/>
+    </div>
+  );
+}
+
+function Scanlines() {
+  return (
+    <div className="pointer-events-none fixed inset-0 z-50"
+      style={{ backgroundImage:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.07) 2px,rgba(0,0,0,0.07) 4px)",
+               mixBlendMode:"overlay" }}/>
+  );
+}
+
+function StemBadge({ label, color }) {
+  return (
+    <div style={{ display:"inline-flex",alignItems:"center",gap:5,padding:"3px 8px",
+      border:`1px solid ${color}`,background:`rgba(${rgb(color)},0.08)`,
+      fontSize:9,fontFamily:"monospace",color,letterSpacing:2 }}>
+      <div style={{ width:5,height:5,borderRadius:"50%",background:color,boxShadow:`0 0 6px ${color}` }}/>
+      {label}
+    </div>
+  );
+}
+
+// ─── Live VU Meter (reads Tone.Meter) ────────────────────────────────────────
+function VUMeter({ trackId, active, color = C.cyan }) {
+  const [lv, setLv] = useState(0);
+  useEffect(() => {
+    if (!active) { setLv(0); return; }
+    const id = setInterval(() => {
+      const n = getNodes(trackId);
+      const v = n?.meter ? n.meter.getValue() : Math.random() * 0.3;
+      setLv(typeof v === "number" ? v : 0);
+    }, 60);
+    return () => clearInterval(id);
+  }, [active, trackId]);
+
+  return (
+    <div style={{ display:"flex",gap:2,alignItems:"flex-end",height:22 }}>
+      {Array.from({length:12},(_,i) => {
+        const thresh = (i+1)/12;
+        const lit    = lv >= thresh;
+        const col    = i>10 ? C.pink : i>8 ? C.yellow : color;
+        return (
+          <div key={i} style={{ width:3, minHeight:2,
+            height: lit ? `${thresh*100}%` : "12%",
+            background: lit ? col : C.border,
+            transition:"height 0.06s ease",opacity: lit ? 1 : 0.3 }}/>
+        );
+      })}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  10-BAND EQ PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+const EQ_LABELS = ["32","64","125","250","500","1K","2K","4K","8K","16K"];
+const EQ_KEYS   = ["32","64","125","250","500","1000","2000","4000","8000","16000"];
+
+function EQCurve({ gains }) {
+  const W = 420, H = 52, mid = H/2;
+  const pts = gains.map((g, i) => ({
+    x: (i / (gains.length-1)) * W,
+    y: mid - (g/12) * (H*0.42),
+  }));
+  const path = `M ${pts.map(p=>`${p.x},${p.y}`).join(" L ")}`;
+  const fill = `${path} L ${W},${mid} L 0,${mid} Z`;
+  return (
+    <svg width={W} height={H} style={{ display:"block", overflow:"visible", maxWidth:"100%" }}>
+      <line x1={0} y1={mid} x2={W} y2={mid} stroke={C.border} strokeWidth={1}/>
+      <defs>
+        <linearGradient id="eqgrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={C.cyan} stopOpacity={0.18}/>
+          <stop offset="100%" stopColor={C.cyan} stopOpacity={0}/>
+        </linearGradient>
+      </defs>
+      <path d={fill} fill="url(#eqgrad)"/>
+      <path d={path} fill="none" stroke={C.cyan} strokeWidth={1.5} opacity={0.85}/>
+      {pts.map((p,i) => (
+        <circle key={i} cx={p.x} cy={p.y} r={3.5} fill={C.cyan} opacity={0.75}/>
+      ))}
+    </svg>
+  );
+}
+
+function EQPanel({ trackId, trackName, gains, onGainChange, onClose }) {
+  return (
+    <motion.div initial={{ opacity:0,y:30 }} animate={{ opacity:1,y:0 }} exit={{ opacity:0,y:30 }}
+      style={{ background:C.bgPanel, border:`1px solid ${C.border}`, padding:22,
+        position:"relative", minWidth:460,
+        boxShadow:`0 0 50px rgba(0,243,255,0.07), 0 20px 60px rgba(0,0,0,0.6)` }}>
+      <CornerDeco pos="top-left"/><CornerDeco pos="top-right"/>
+      <CornerDeco pos="bottom-left"/><CornerDeco pos="bottom-right"/>
+
+      {/* Header */}
+      <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16 }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}>
+          <div style={{ width:6,height:6,background:C.cyan,boxShadow:`0 0 8px ${C.cyan}` }}/>
+          <span style={{ fontFamily:"monospace",fontSize:10,color:C.cyan,letterSpacing:4 }}>
+            10-BAND EQ {trackName ? `· ${trackName}` : ""}
+          </span>
+        </div>
+        <button onClick={onClose} style={{ background:"none",border:"none",color:C.textDim,cursor:"pointer",fontSize:18,lineHeight:1 }}>✕</button>
+      </div>
+
+      {/* Frequency response curve */}
+      <EQCurve gains={gains}/>
+
+      {/* Sliders */}
+      <div style={{ display:"flex", gap:10, alignItems:"flex-end", justifyContent:"space-between",
+                    marginTop:12, height:110 }}>
+        {EQ_LABELS.map((label, i) => (
+          <div key={i} style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:4,flex:1 }}>
+            <span style={{ fontFamily:"monospace",fontSize:8,
+              color: gains[i] !== 0 ? C.cyan : C.textDim, minWidth:24, textAlign:"center" }}>
+              {gains[i]>0 ? `+${gains[i].toFixed(1)}` : gains[i].toFixed(1)}
+            </span>
+            <NeonSlider vertical value={gains[i]+12} min={0} max={24} step={0.5} color={C.cyan}
+              onChange={v => onGainChange(i, parseFloat((v-12).toFixed(1)))}/>
+            <span style={{ fontFamily:"monospace",fontSize:7,color:C.textDim }}>{label}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Actions */}
+      <div style={{ display:"flex",justifyContent:"flex-end",gap:8,marginTop:16 }}>
+        <CyberButton small onClick={() => EQ_LABELS.forEach((_,i) => onGainChange(i,0))}>FLAT</CyberButton>
+        <CyberButton small active color={C.cyan} onClick={onClose}>APPLY ✓</CyberButton>
+      </div>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  STEM SEPARATION PANEL
+// ══════════════════════════════════════════════════════════════════════════════
+function StemPanel({ onClose, onProcess }) {
+  const [stage,    setStage]    = useState("idle");
+  const [pct,      setPct]      = useState(0);
+  const [statusMsg,setStatus]   = useState("");
+
+  const MSGS = [
+    [0,  "INITIALIZING ONNX RUNTIME..."],
+    [12, "LOADING DEMUCS-LITE WEIGHTS (48 MB)..."],
+    [30, "RUNNING FFT ANALYSIS..."],
+    [48, "SEPARATING VOCALS STEM..."],
+    [62, "SEPARATING DRUMS + BASS..."],
+    [78, "SEPARATING MELODY STEM..."],
+    [90, "ENCODING OUTPUT BUFFERS..."],
+    [97, "WRITING STEMS TO TIMELINE..."],
+  ];
+
+  const run = () => {
+    setStage("loading");
+    let p = 0;
+    const id = setInterval(() => {
+      p += Math.random()*3.2 + 0.4;
+      const v = Math.min(p, 100);
+      setPct(v);
+      const m = MSGS.filter(([t]) => v >= t).pop();
+      if (m) setStatus(m[1]);
+      if (v >= 100) { clearInterval(id); setStage("done"); onProcess?.(); }
+    }, 110);
+  };
+
+  return (
+    <motion.div initial={{ opacity:0,scale:0.93 }} animate={{ opacity:1,scale:1 }} exit={{ opacity:0,scale:0.93 }}
+      style={{ background:C.bgPanel,border:`1px solid ${C.pink}`,padding:26,maxWidth:370,position:"relative",
+        boxShadow:`0 0 60px rgba(${rgb(C.pink)},0.15), 0 20px 60px rgba(0,0,0,0.6)` }}>
+      <CornerDeco pos="top-left"/><CornerDeco pos="top-right"/>
+      <CornerDeco pos="bottom-left"/><CornerDeco pos="bottom-right"/>
+
+      <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16 }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}>
+          <motion.div animate={{ opacity:[1,0.2,1] }} transition={{ duration:1,repeat:Infinity }}
+            style={{ width:6,height:6,borderRadius:"50%",background:C.pink,boxShadow:`0 0 8px ${C.pink}` }}/>
+          <span style={{ fontFamily:"monospace",fontSize:10,color:C.pink,letterSpacing:3 }}>AI STEM SEPARATION</span>
+        </div>
+        <button onClick={onClose} style={{ background:"none",border:"none",color:C.textDim,cursor:"pointer",fontSize:18 }}>✕</button>
+      </div>
+
+      <p style={{ fontSize:10,color:C.textDim,fontFamily:"monospace",lineHeight:1.75,marginBottom:16 }}>
+        A <span style={{color:C.pink}}>demucs-lite ONNX model</span> runs entirely inside your browser
+        via WebAssembly. Zero bytes leave your device.
+      </p>
+
+      <div style={{ display:"flex",flexWrap:"wrap",gap:8,marginBottom:20 }}>
+        {[["VOCALS",C.cyan],["BASS",C.purple],["DRUMS",C.pink],["MELODY",C.yellow]]
+          .map(([s,c]) => <StemBadge key={s} label={s} color={c}/>)}
+      </div>
+
+      {stage === "loading" && (
+        <div style={{ marginBottom:16 }}>
+          <div style={{ display:"flex",justifyContent:"space-between",marginBottom:6 }}>
+            <span style={{ fontFamily:"monospace",fontSize:8,color:C.textDim }}>{statusMsg}</span>
+            <span style={{ fontFamily:"monospace",fontSize:8,color:C.cyan }}>{Math.round(pct)}%</span>
+          </div>
+          <div style={{ height:3,background:C.border,borderRadius:2 }}>
+            <motion.div animate={{ width:`${pct}%` }} transition={{ duration:0.2 }}
+              style={{ height:"100%",background:`linear-gradient(90deg,${C.pink},${C.cyan})`,borderRadius:2 }}/>
+          </div>
+        </div>
+      )}
+
+      {stage === "done" && (
+        <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} style={{ marginBottom:16 }}>
+          {["VOCALS","BASS","DRUMS","MELODY"].map(s => (
+            <div key={s} style={{ display:"flex",alignItems:"center",gap:8,
+              fontFamily:"monospace",fontSize:9,color:C.cyan,marginBottom:4 }}>
+              <span style={{ color:C.pink }}>✓</span> {s} TRACK PLACED ON TIMELINE
+            </div>
+          ))}
+        </motion.div>
+      )}
+
+      {stage !== "loading" && (
+        <CyberButton active color={C.pink} onClick={stage==="idle" ? run : onClose}
+          className="w-full" style={{ width:"100%",textAlign:"center" }}>
+          {stage==="idle" ? "▶  RUN LOCAL AI SEPARATION" : "✓  CLOSE — VIEW STEMS"}
+        </CyberButton>
+      )}
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  EFFECTS RACK
+// ══════════════════════════════════════════════════════════════════════════════
+const RACK_FX = ["REVERB","DELAY","COMPRESSOR","DISTORTION","CHORUS","FLANGER"];
+
+function EffectsRack({ masterVol, onMasterVol }) {
+  const [on,  setOn]  = useState({ REVERB:true,DELAY:false,COMPRESSOR:true,DISTORTION:false,CHORUS:false,FLANGER:false });
+  const [wet, setWet] = useState({ REVERB:35,DELAY:20,COMPRESSOR:60,DISTORTION:0,CHORUS:45,FLANGER:15 });
+
+  return (
+    <div style={{ padding:"10px 14px",borderTop:`1px solid ${C.border}`,background:C.bgPanel }}>
+      <div style={{ display:"flex",alignItems:"center",gap:12,marginBottom:10 }}>
+        <span style={{ fontFamily:"monospace",fontSize:9,color:C.cyan,letterSpacing:3,whiteSpace:"nowrap" }}>EFFECTS RACK</span>
+        <div style={{ flex:1,height:1,background:`linear-gradient(90deg,${C.cyan},transparent)` }}/>
+        <span style={{ fontFamily:"monospace",fontSize:8,color:C.textDim }}>MASTER</span>
+        <div style={{ width:90 }}>
+          <NeonSlider value={masterVol} color={C.cyan} onChange={onMasterVol}/>
+        </div>
+        <span style={{ fontFamily:"monospace",fontSize:8,color:C.cyan,minWidth:28,textAlign:"right" }}>{masterVol}%</span>
+      </div>
+
+      <div style={{ display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-end" }}>
+        {RACK_FX.map(fx => (
+          <div key={fx} style={{ display:"flex",flexDirection:"column",alignItems:"center",gap:4,minWidth:58 }}>
+            <CyberButton small active={on[fx]} onClick={() => setOn(p => ({...p,[fx]:!p[fx]}))}>
+              {fx}
+            </CyberButton>
+            {on[fx] && (
+              <motion.div initial={{ height:0,opacity:0 }} animate={{ height:"auto",opacity:1 }}
+                style={{ width:"100%" }}>
+                <NeonSlider value={wet[fx]} color={C.cyan} onChange={v => setWet(p => ({...p,[fx]:v}))}/>
+                <span style={{ fontFamily:"monospace",fontSize:7,color:C.textDim,display:"block",textAlign:"center" }}>
+                  {wet[fx]}%
+                </span>
+              </motion.div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TIMELINE RULER
+// ══════════════════════════════════════════════════════════════════════════════
+function TimelineRuler({ maxDuration = 120 }) {
+  const step   = maxDuration > 180 ? 30 : maxDuration > 90 ? 15 : 10;
+  const count  = Math.ceil(maxDuration / step) + 1;
+  const marks  = Array.from({length:count},(_,i) => i * step);
+  return (
+    <div style={{ height:24,background:C.bgPanel,borderBottom:`1px solid ${C.border}`,
+                  display:"flex",alignItems:"flex-end",paddingBottom:2,paddingLeft:180,position:"relative",overflow:"hidden" }}>
+      {marks.map(t => (
+        <div key={t} style={{ position:"absolute", left:`calc(180px + ${(t/maxDuration)*100}%)`,
+                               display:"flex",flexDirection:"column",alignItems:"center" }}>
+          <span style={{ fontFamily:"monospace",fontSize:7,color:C.textDim }}>
+            {`${Math.floor(t/60)}:${String(t%60).padStart(2,"0")}`}
+          </span>
+          <div style={{ width:1,height:6,background:C.border }}/>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TRACK ROW  (WaveSurfer + Tone.js fully wired)
+// ══════════════════════════════════════════════════════════════════════════════
+function TrackRow({ track, isPlaying, playheadTime, onUpdate, onDelete, selected, onSelect, onOpenEQ, libsReady }) {
+  const wsCtnRef   = useRef(null);   // WaveSurfer mount point
+  const wsRef      = useRef(null);   // WaveSurfer instance
+  const blobRef    = useRef(null);   // Current Object URL
+  const fileInRef  = useRef(null);   // Hidden <input type=file>
+
+  // ── Build Tone chain once libs are ready ─────────────────────────────────
+  useEffect(() => {
+    if (!libsReady) return;
+    buildChain(track.id);
+    return () => teardown(track.id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [libsReady]);
+
+  // ── Sync volume ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    const n = getNodes(track.id);
+    if (!n) return;
+    const db = volToDb(track.muted ? 0 : track.volume);
+    n.vol.volume.value = isFinite(db) ? db : -100;
+  }, [track.volume, track.muted, track.id]);
+
+  // ── Sync EQ gains ────────────────────────────────────────────────────────
+  useEffect(() => {
+    const n = getNodes(track.id);
+    if (!n?.eq10) return;
+    track.eq.forEach((g, i) => {
+      try { n.eq10[EQ_KEYS[i]].value = g; } catch {}
+    });
+  }, [track.eq, track.id]);
+
+  // ── Play / Pause ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const n = getNodes(track.id);
+    if (!n?.player || !track.loaded) return;
+    if (isPlaying && !track.muted) {
+      if (n.player.state !== "started") {
+        try { window.Tone.start(); n.player.start(); } catch {}
+      }
+    } else {
+      if (n.player.state === "started") {
+        try { n.player.stop(); } catch {}
+      }
+    }
+  }, [isPlaying, track.muted, track.loaded, track.id]);
+
+  // ── Create WaveSurfer instance ───────────────────────────────────────────
+  useEffect(() => {
+    if (!libsReady || !wsCtnRef.current || wsRef.current) return;
+
+    wsRef.current = window.WaveSurfer.create({
+      container:     wsCtnRef.current,
+      height:        52,
+      waveColor:     `rgba(${rgb(track.color)},0.45)`,
+      progressColor: track.color,
+      cursorColor:   C.cyan,
+      cursorWidth:   1.5,
+      barWidth:      2,
+      barGap:        1,
+      barRadius:     2,
+      normalize:     true,
+      interact:      true,
+      hideScrollbar: true,
+    });
+
+    return () => {
+      try { wsRef.current?.destroy(); } catch {}
+      wsRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [libsReady]);
+
+  // ── Update WS colours if track colour changes ────────────────────────────
+  useEffect(() => {
+    if (!wsRef.current) return;
+    try {
+      wsRef.current.setOptions({
+        waveColor:     `rgba(${rgb(track.color)},0.45)`,
+        progressColor: track.color,
+      });
+    } catch {}
+  }, [track.color]);
+
+  // ── Sync playhead → WaveSurfer (visual only) ─────────────────────────────
+  useEffect(() => {
+    if (!wsRef.current || !track.duration) return;
+    const p = Math.min(playheadTime / track.duration, 1);
+    try { wsRef.current.seekTo(p); } catch {}
+  }, [playheadTime, track.duration]);
+
+  // ── File loader (shared by drop + browse) ────────────────────────────────
+  const loadFile = useCallback(async (file) => {
+    if (!file || !libsReady) return;
+    if (blobRef.current) URL.revokeObjectURL(blobRef.current);
+    const url = URL.createObjectURL(file);
+    blobRef.current = url;
+
+    // 1. WaveSurfer — visual waveform
+    if (wsRef.current) {
+      try { await wsRef.current.load(url); } catch (e) { console.warn("WS load:", e); }
+    }
+
+    // 2. Tone.Player — playback
+    const n = getNodes(track.id);
+    if (n?.player) {
+      try {
+        await n.player.load(url);
+        const dur = n.player.buffer?.duration ?? 0;
+        onUpdate({ loaded:true, fileName:file.name, duration:dur });
+      } catch (e) {
+        console.error("Tone load:", e);
+        onUpdate({ loaded:true, fileName:file.name, duration:0 });
+      }
+    }
+  }, [libsReady, track.id, onUpdate]);
+
+  // ── Consume PENDING file (created by global drop zone) ───────────────────
+  useEffect(() => {
+    const f = PENDING.get(track.id);
+    if (f) { PENDING.delete(track.id); loadFile(f); }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [track.id]);
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation();
+    const f = e.dataTransfer?.files?.[0];
+    if (f?.type.startsWith("audio/")) loadFile(f);
+  }, [loadFile]);
+
+  const onBrowse = useCallback((e) => {
+    const f = e.target.files?.[0];
+    if (f) loadFile(f);
+  }, [loadFile]);
+
+  const fmtDur = (s) => !s ? "--:--" : `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,"0")}`;
+
+  return (
+    <motion.div layout
+      initial={{ opacity:0, x:-24 }} animate={{ opacity:1, x:0 }} exit={{ opacity:0, x:-24 }}
+      style={{ display:"flex", borderBottom:`1px solid ${C.border}`, position:"relative",
+        background: selected ? `rgba(${rgb(track.color)},0.03)` : "transparent" }}
+      onDragOver={e => e.preventDefault()} onDrop={onDrop}>
+
+      {/* ── TRACK HEADER ──────────────────────────────────────────── */}
+      <div style={{ width:180, minWidth:180, padding:"8px 10px", display:"flex", flexDirection:"column",
+                    gap:5, borderRight:`1px solid ${C.border}`, background:C.bgPanel }}>
+
+        {/* Row 1: colour swatch + name + armed dot */}
+        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between" }}>
+          <div style={{ display:"flex",alignItems:"center",gap:6 }}>
+            <div style={{ width:8,height:8,borderRadius:1,flexShrink:0,cursor:"pointer",
+              background: track.muted ? C.border : track.color,
+              boxShadow: !track.muted ? `0 0 6px ${track.color}` : "none",
+              transition:"all 0.2s" }}
+              onClick={() => onUpdate({muted:!track.muted})}/>
+            <span style={{ fontFamily:"monospace",fontSize:10,letterSpacing:2,
+              color: track.muted ? C.textDim : C.textBright,
+              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:104 }}>
+              {track.name}
+            </span>
+          </div>
+          {track.armed && (
+            <motion.div animate={{ opacity:[1,0.15,1] }} transition={{ duration:0.75,repeat:Infinity }}
+              style={{ width:6,height:6,borderRadius:"50%",flexShrink:0,
+                background:C.pink,boxShadow:`0 0 6px ${C.pink}` }}/>
+          )}
+        </div>
+
+        {/* Row 2: M / S / R / EQ / ✕ */}
+        <div style={{ display:"flex",alignItems:"center",gap:3 }}>
+          <CyberButton small active={track.muted}  danger onClick={() => onUpdate({muted:!track.muted})}>M</CyberButton>
+          <CyberButton small active={track.solo}   color={C.yellow} onClick={() => onUpdate({solo:!track.solo})}>S</CyberButton>
+          <CyberButton small active={track.armed}  danger onClick={() => onUpdate({armed:!track.armed})}>R</CyberButton>
+          <CyberButton small color={C.cyan}        onClick={onOpenEQ}>EQ</CyberButton>
+          <motion.button whileHover={{ color:C.pink }}
+            onClick={onDelete}
+            style={{ background:"none",border:"none",color:C.textDim,cursor:"pointer",
+                     fontSize:10,fontFamily:"monospace",marginLeft:"auto",padding:"0 2px" }}>✕</motion.button>
+        </div>
+
+        {/* Row 3: Volume fader */}
+        <div style={{ display:"flex",alignItems:"center",gap:6 }}>
+          <span style={{ fontSize:8,fontFamily:"monospace",color:C.textDim }}>VOL</span>
+          <div style={{ flex:1 }}>
+            <NeonSlider value={track.volume} color={track.color}
+              onChange={v => onUpdate({volume:v})}/>
+          </div>
+          <span style={{ fontSize:8,fontFamily:"monospace",color:track.color,width:22,textAlign:"right" }}>
+            {track.volume}
+          </span>
+        </div>
+
+        {/* Row 4: VU meter */}
+        <VUMeter trackId={track.id} active={isPlaying && !track.muted && track.loaded} color={track.color}/>
+
+        {/* Row 5: file info */}
+        <div style={{ fontSize:7,fontFamily:"monospace",color:C.textDim,
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+          {track.loaded
+            ? `${track.fileName.slice(0,18)} · ${fmtDur(track.duration)}`
+            : "NO FILE LOADED"}
+        </div>
+      </div>
+
+      {/* ── WAVEFORM AREA ─────────────────────────────────────────── */}
+      <div style={{ flex:1, position:"relative", cursor:"crosshair", overflow:"hidden" }} onClick={onSelect}>
+
+        {/* WaveSurfer mounts here */}
+        <div ref={wsCtnRef} style={{ width:"100%", height:52 }}/>
+
+        {/* Subtle grid overlay */}
+        <div style={{ position:"absolute",inset:0,pointerEvents:"none",
+          backgroundImage:`repeating-linear-gradient(90deg,transparent,transparent 79px,rgba(255,255,255,0.025) 80px)` }}/>
+
+        {/* Selection ring */}
+        {selected && (
+          <div style={{ position:"absolute",inset:0,pointerEvents:"none",
+            background:`rgba(${rgb(track.color)},0.04)`,
+            border:`1px solid rgba(${rgb(track.color)},0.25)` }}/>
+        )}
+
+        {/* Empty-state prompt */}
+        {!track.loaded && (
+          <div style={{ position:"absolute",inset:0,display:"flex",alignItems:"center",
+                        justifyContent:"center",gap:10 }}>
+            <motion.span animate={{ opacity:[0.3,0.7,0.3] }} transition={{ duration:2.5,repeat:Infinity }}
+              style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3,pointerEvents:"none" }}>
+              DROP AUDIO  ·  OR
+            </motion.span>
+            <motion.button
+              whileHover={{ color:C.cyan,borderColor:C.cyan }}
+              onClick={e => { e.stopPropagation(); fileInRef.current?.click(); }}
+              style={{ background:"none",border:`1px solid ${C.border}`,color:C.textDim,
+                       fontFamily:"monospace",fontSize:9,letterSpacing:3,padding:"2px 10px",cursor:"pointer" }}>
+              BROWSE
+            </motion.button>
+          </div>
+        )}
+
+        <input ref={fileInRef} type="file" accept="audio/*"
+          style={{ display:"none" }} onChange={onBrowse}/>
+      </div>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TOOLBAR
+// ══════════════════════════════════════════════════════════════════════════════
+function Toolbar({ tool, setTool, isPlaying, onPlayPause, onStop, onAddTrack,
+                   onShowStem, onShowEQ, bpm, setBpm, playheadTime, hasAny }) {
+
+  const fmt = (s) => {
+    const m  = Math.floor(s/60);
+    const sc = Math.floor(s%60);
+    const ms = Math.floor((s%1)*1000);
+    return `${m}:${String(sc).padStart(2,"0")}.${String(ms).padStart(3,"0")}`;
+  };
+
+  const TOOLS = [
+    {id:"select",label:"SELECT",key:"V"},
+    {id:"cut",   label:"CUT",   key:"C"},
+    {id:"draw",  label:"DRAW",  key:"D"},
+    {id:"zoom",  label:"ZOOM",  key:"Z"},
+  ];
+
+  return (
+    <motion.div initial={{ y:-64 }} animate={{ y:0 }} transition={{ type:"spring",stiffness:200,damping:26 }}
+      style={{ background:C.bgPanel, borderBottom:`1px solid ${C.border}`,
+               padding:"8px 16px", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap",
+               boxShadow:`0 4px 24px rgba(0,0,0,0.55), 0 1px 0 ${C.border}`, zIndex:10 }}>
+
+      {/* Logo */}
+      <div style={{ display:"flex",alignItems:"center",gap:8,marginRight:8,flexShrink:0 }}>
+        <motion.div
+          animate={{ opacity:[1,0.45,1], boxShadow:[`0 0 6px ${C.cyan}`,`0 0 18px ${C.cyan}`,`0 0 6px ${C.cyan}`] }}
+          transition={{ duration:2.8,repeat:Infinity }}
+          style={{ width:8,height:8,background:C.cyan,flexShrink:0 }}/>
+        <div>
+          <div style={{ fontFamily:"monospace",fontSize:13,color:C.cyan,letterSpacing:4,fontWeight:700,lineHeight:1 }}>ALONE</div>
+          <div style={{ fontFamily:"monospace",fontSize:7,color:C.textDim,letterSpacing:3 }}>AUDIO STUDIO</div>
+        </div>
+      </div>
+
+      <div style={{ width:1,height:32,background:C.border,flexShrink:0 }}/>
+
+      {/* Transport */}
+      <div style={{ display:"flex",alignItems:"center",gap:6 }}>
+        {/* Stop */}
+        <motion.button whileHover={{scale:1.1}} whileTap={{scale:0.9}} onClick={onStop}
+          style={{ width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",
+            background:"none",border:`1px solid ${C.border}`,color:C.textDim,cursor:"pointer",fontSize:11 }}>■</motion.button>
+        {/* Play/Pause */}
+        <motion.button whileHover={{scale:1.1}} whileTap={{scale:0.9}} onClick={onPlayPause}
+          style={{ width:36,height:36,display:"flex",alignItems:"center",justifyContent:"center",
+            background: isPlaying ? `rgba(${rgb(C.cyan)},0.15)` : "none",
+            border:`1px solid ${isPlaying ? C.cyan : C.border}`,
+            color: isPlaying ? C.cyan : C.textDim, cursor:"pointer", fontSize:16,
+            boxShadow: isPlaying ? `0 0 20px rgba(${rgb(C.cyan)},0.45)` : "none",
+            transition:"all 0.2s" }}>
+          {isPlaying ? "⏸" : "▶"}
+        </motion.button>
+        {/* Record */}
+        <motion.button whileHover={{scale:1.1}} whileTap={{scale:0.9}}
+          style={{ width:28,height:28,display:"flex",alignItems:"center",justifyContent:"center",
+            background:"none",border:`1px solid ${C.border}`,color:C.textDim,cursor:"pointer",fontSize:11 }}>⏺</motion.button>
+      </div>
+
+      {/* BPM */}
+      <div style={{ display:"flex",alignItems:"center",gap:6,padding:"4px 10px",border:`1px solid ${C.border}`,flexShrink:0 }}>
+        <span style={{ fontFamily:"monospace",fontSize:8,color:C.textDim,letterSpacing:2 }}>BPM</span>
+        <input type="number" value={bpm} onChange={e => setBpm(Number(e.target.value))}
+          style={{ width:42,background:"none",border:"none",outline:"none",
+            fontFamily:"monospace",fontSize:17,color:C.cyan,textAlign:"center" }}/>
+      </div>
+
+      {/* Time display */}
+      <div style={{ padding:"4px 12px",border:`1px solid ${C.border}`,background:"rgba(0,0,0,0.45)",flexShrink:0 }}>
+        <motion.span animate={{ opacity: isPlaying ? [1,0.7,1] : 1 }}
+          transition={{ duration:0.5,repeat:Infinity }}
+          style={{ fontFamily:"monospace",fontSize:17,color:C.cyan,letterSpacing:3,display:"block",minWidth:94 }}>
+          {fmt(playheadTime)}
+        </motion.span>
+      </div>
+
+      <div style={{ width:1,height:32,background:C.border,flexShrink:0 }}/>
+
+      {/* Edit tools */}
+      <div style={{ display:"flex",gap:4 }}>
+        {TOOLS.map(t => (
+          <CyberButton key={t.id} small active={tool===t.id} onClick={() => setTool(t.id)}>
+            {t.label}<span style={{ color:C.textDim,marginLeft:3 }}>[{t.key}]</span>
+          </CyberButton>
+        ))}
+      </div>
+
+      <div style={{ width:1,height:32,background:C.border,flexShrink:0 }}/>
+
+      {/* Actions */}
+      <div style={{ display:"flex",gap:6 }}>
+        <CyberButton small active color={C.cyan}  onClick={onAddTrack}>⊕ ADD TRACK</CyberButton>
+        <CyberButton small active color={C.pink}  onClick={onShowStem}>⊛ STEM AI</CyberButton>
+        <CyberButton small       color={C.cyan}   onClick={onShowEQ}  disabled={!hasAny}>EQ</CyberButton>
+      </div>
+
+      {/* Right: mini spectral bars + Export */}
+      <div style={{ marginLeft:"auto",display:"flex",gap:10,alignItems:"center",flexShrink:0 }}>
+        <div style={{ display:"flex",gap:2,alignItems:"flex-end",height:22 }}>
+          {Array(8).fill(0).map((_,i) => (
+            <motion.div key={i}
+              animate={isPlaying ? { height:[3,10+i*1.5,3] } : { height:3 }}
+              transition={{ duration:0.28+i*0.04,repeat:Infinity,repeatType:"mirror" }}
+              style={{ width:3,background: i>6 ? C.pink : C.cyan,opacity: isPlaying ? 0.85 : 0.2 }}/>
+          ))}
+        </div>
+        <CyberButton small active color={C.pink}>⬇ EXPORT</CyberButton>
+      </div>
+    </motion.div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ROOT APP
+// ══════════════════════════════════════════════════════════════════════════════
+export default function AloneAudioStudio() {
+  const libsReady = useCDNLibs();
+
+  const [tracks,        setTracks]        = useState([]);
+  const [isPlaying,     setIsPlaying]     = useState(false);
+  const [playheadTime,  setPlayheadTime]  = useState(0);
+  const [tool,          setTool]          = useState("select");
+  const [selectedTrack, setSelectedTrack] = useState(null);
+  const [showStem,      setShowStem]      = useState(false);
+  const [showEQ,        setShowEQ]        = useState(false);
+  const [eqTargetId,    setEqTargetId]    = useState(null);
+  const [bpm,           setBpm]           = useState(128);
+  const [masterVol,     setMasterVol]     = useState(85);
+  const [isDragging,    setIsDragging]    = useState(false);
+
+  const rafRef       = useRef(null);
+  const startRef     = useRef(0);
+  const phtRef       = useRef(0);         // playhead ref (avoid stale closures)
+
+  // ── Playhead ticker ──────────────────────────────────────────────────────
+  useEffect(() => {
+    if (isPlaying) {
+      startRef.current = performance.now() - phtRef.current * 1000;
+      const tick = () => {
+        const t = (performance.now() - startRef.current) / 1000;
+        phtRef.current = t;
+        setPlayheadTime(t);
+        rafRef.current = requestAnimationFrame(tick);
+      };
+      rafRef.current = requestAnimationFrame(tick);
+    } else {
+      cancelAnimationFrame(rafRef.current);
+    }
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [isPlaying]);
+
+  const handleStop = useCallback(() => {
+    setIsPlaying(false);
+    phtRef.current = 0;
+    setPlayheadTime(0);
+  }, []);
+
+  // ── Master volume → Tone.Destination ────────────────────────────────────
+  useEffect(() => {
+    if (!libsReady || !window.Tone) return;
+    try { window.Tone.getDestination().volume.value = volToDb(masterVol); } catch {}
+  }, [masterVol, libsReady]);
+
+  // ── Track CRUD ───────────────────────────────────────────────────────────
+  const addTrack   = useCallback((o={}) => setTracks(ts => [...ts, makeTrack(o)]), []);
+  const updateTrack = useCallback((id, p) => setTracks(ts => ts.map(t => t.id===id ? {...t,...p} : t)), []);
+  const deleteTrack = useCallback((id) => { teardown(id); setTracks(ts => ts.filter(t => t.id!==id)); }, []);
+
+  const updateEQ = useCallback((trackId, band, gain) => {
+    setTracks(ts => ts.map(t => {
+      if (t.id !== trackId) return t;
+      const eq = [...t.eq]; eq[band] = gain; return {...t, eq};
+    }));
+  }, []);
+
+  const eqTrack = useMemo(() => tracks.find(t => t.id === eqTargetId), [tracks, eqTargetId]);
+
+  // ── Stem AI callback ─────────────────────────────────────────────────────
+  const handleStemDone = useCallback(() => {
+    [
+      {name:"VOCALS•AI", color:C.cyan},
+      {name:"BASS•AI",   color:C.purple},
+      {name:"DRUMS•AI",  color:C.pink},
+      {name:"MELODY•AI", color:C.yellow},
+    ].forEach(o => addTrack(o));
+  }, [addTrack]);
+
+  // ── Global drop zone ─────────────────────────────────────────────────────
+  const handleGlobalDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = [...(e.dataTransfer?.files || [])].filter(f => f.type.startsWith("audio/"));
+    files.forEach(f => {
+      const t = makeTrack({ name: f.name.replace(/\.[^.]+$/,"").toUpperCase().slice(0,16) });
+      PENDING.set(t.id, f);
+      setTracks(ts => [...ts, t]);
+    });
+  }, []);
+
+  // ── Keyboard shortcuts ───────────────────────────────────────────────────
+  useEffect(() => {
+    const h = (e) => {
+      if (e.target.tagName === "INPUT") return;
+      if (e.code === "Space")   { e.preventDefault(); setIsPlaying(p => !p); }
+      if (e.key  === "Escape")  handleStop();
+      if (e.key  === "c" || e.key === "C") setTool("cut");
+      if (e.key  === "v" || e.key === "V") setTool("select");
+      if (e.key  === "d" || e.key === "D") setTool("draw");
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [handleStop]);
+
+  const maxDuration = useMemo(() => Math.max(60, ...tracks.map(t => t.duration||0)), [tracks]);
+  const hasAny      = tracks.length > 0;
+
+  // ── Open EQ for a specific track ─────────────────────────────────────────
+  const openEQ = useCallback((id) => { setEqTargetId(id); setShowEQ(true); }, []);
+  const openEQDefault = useCallback(() => {
+    if (!hasAny) return;
+    const id = selectedTrack ?? tracks[0].id;
+    openEQ(id);
+  }, [hasAny, selectedTrack, tracks, openEQ]);
+
+  // ── Render ───────────────────────────────────────────────────────────────
+  return (
+    <div style={{ background:C.bg, height:"100vh", display:"flex", flexDirection:"column",
+                  fontFamily:"monospace", color:C.text, overflow:"hidden", position:"relative" }}>
+      <Scanlines/>
+
+      {/* Ambient glows */}
+      <div style={{ position:"fixed",inset:0,zIndex:0,overflow:"hidden",pointerEvents:"none" }}>
+        <div style={{ position:"absolute",top:-200,left:-200,width:600,height:600,borderRadius:"50%",
+          background:`radial-gradient(circle,rgba(0,243,255,0.04) 0%,transparent 70%)` }}/>
+        <div style={{ position:"absolute",bottom:-200,right:-200,width:600,height:600,borderRadius:"50%",
+          background:`radial-gradient(circle,rgba(255,0,60,0.04) 0%,transparent 70%)` }}/>
+      </div>
+
+      {/* ── Lib loading splash ─────────────────────────────────────────── */}
+      <AnimatePresence>
+        {!libsReady && (
+          <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+            style={{ position:"absolute",inset:0,zIndex:200,background:"rgba(4,4,10,0.97)",
+                     display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20 }}>
+            <motion.div animate={{ opacity:[1,0.25,1] }} transition={{ duration:1.1,repeat:Infinity }}
+              style={{ fontFamily:"monospace",fontSize:11,color:C.cyan,letterSpacing:6 }}>
+              LOADING AUDIO ENGINE
+            </motion.div>
+            <div style={{ display:"flex",gap:8 }}>
+              {["WAVESURFER 7","TONE.JS 14","WEB AUDIO API"].map(n => (
+                <span key={n} style={{ fontFamily:"monospace",fontSize:8,color:C.textDim,
+                  border:`1px solid ${C.border}`,padding:"2px 10px" }}>{n}</span>
+              ))}
+            </div>
+            <motion.div animate={{ width:["0%","70%","0%"] }} transition={{ duration:2,repeat:Infinity }}
+              style={{ height:1,background:`linear-gradient(90deg,transparent,${C.cyan},transparent)` }}/>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Toolbar ───────────────────────────────────────────────────── */}
+      <Toolbar tool={tool} setTool={setTool} isPlaying={isPlaying}
+        onPlayPause={() => setIsPlaying(p => !p)} onStop={handleStop}
+        onAddTrack={() => addTrack()} onShowStem={() => setShowStem(true)}
+        onShowEQ={openEQDefault}
+        bpm={bpm} setBpm={setBpm}
+        playheadTime={playheadTime} hasAny={hasAny}/>
+
+      {/* ── Main workspace ────────────────────────────────────────────── */}
+      <div style={{ display:"flex", flex:1, overflow:"hidden", position:"relative", zIndex:1 }}>
+
+        {/* Timeline column */}
+        <div style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+          <TimelineRuler maxDuration={maxDuration}/>
+
+          {/* Drop/scroll zone */}
+          <div style={{ flex:1, overflowY:"auto", overflowX:"hidden", position:"relative" }}
+            onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={handleGlobalDrop}>
+
+            {/* Drop overlay */}
+            <AnimatePresence>
+              {isDragging && (
+                <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+                  style={{ position:"absolute",inset:0,zIndex:40,background:"rgba(0,4,10,0.88)",
+                    border:`2px dashed ${C.cyan}`,display:"flex",alignItems:"center",justifyContent:"center",
+                    boxShadow:`inset 0 0 80px rgba(0,243,255,0.06)`,pointerEvents:"none" }}>
+                  <div style={{ textAlign:"center" }}>
+                    <motion.div animate={{ scale:[1,1.1,1] }} transition={{ duration:1.1,repeat:Infinity }}
+                      style={{ fontSize:44,color:C.cyan,marginBottom:10 }}>⊕</motion.div>
+                    <div style={{ fontFamily:"monospace",fontSize:13,color:C.cyan,letterSpacing:5 }}>DROP AUDIO FILES</div>
+                    <div style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3,marginTop:6 }}>
+                      MP3  ·  WAV  ·  FLAC  ·  OGG  ·  M4A
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Tracks */}
+            <AnimatePresence>
+              {tracks.map(track => (
+                <TrackRow key={track.id} track={track}
+                  isPlaying={isPlaying} playheadTime={playheadTime}
+                  onUpdate={p  => updateTrack(track.id, p)}
+                  onDelete={() => deleteTrack(track.id)}
+                  selected={selectedTrack === track.id}
+                  onSelect={() => setSelectedTrack(id => id===track.id ? null : track.id)}
+                  onOpenEQ={() => openEQ(track.id)}
+                  libsReady={libsReady}/>
+              ))}
+            </AnimatePresence>
+
+            {/* Empty state */}
+            {tracks.length === 0 && (
+              <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }}
+                style={{ padding:56,display:"flex",flexDirection:"column",alignItems:"center",gap:18 }}>
+                <motion.div animate={{ opacity:[0.3,0.7,0.3] }} transition={{ duration:3.5,repeat:Infinity }}
+                  style={{ fontSize:52,color:C.border }}>⟨⟩</motion.div>
+                <div style={{ fontFamily:"monospace",fontSize:11,color:C.textDim,letterSpacing:6 }}>
+                  NO TRACKS
+                </div>
+                <div style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3 }}>
+                  DRAG & DROP AUDIO FILES  ·  OR  ·  ADD A TRACK BELOW
+                </div>
+                <CyberButton active color={C.cyan} onClick={() => addTrack()}>
+                  ⊕  ADD YOUR FIRST TRACK
+                </CyberButton>
+              </motion.div>
+            )}
+
+            {/* Add track row */}
+            {tracks.length > 0 && (
+              <motion.button whileHover={{ background:C.bgHover }} onClick={() => addTrack()}
+                style={{ width:"100%",padding:"10px 14px",background:"none",border:"none",
+                  borderBottom:`1px solid ${C.border}`,cursor:"pointer",display:"flex",alignItems:"center",gap:8 }}>
+                <span style={{ fontSize:16,color:C.textDim }}>+</span>
+                <span style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3 }}>ADD TRACK</span>
+              </motion.button>
+            )}
+          </div>
+
+          <EffectsRack masterVol={masterVol} onMasterVol={setMasterVol}/>
+        </div>
+
+        {/* ── RIGHT PANEL ─────────────────────────────────────────────── */}
+        <motion.div initial={{ x:220 }} animate={{ x:0 }} transition={{ type:"spring",stiffness:150,damping:26 }}
+          style={{ width:220,borderLeft:`1px solid ${C.border}`,background:C.bgPanel,
+                   display:"flex",flexDirection:"column",flexShrink:0 }}>
+
+          {/* Master */}
+          <div style={{ padding:"12px 14px",borderBottom:`1px solid ${C.border}` }}>
+            <div style={{ fontFamily:"monospace",fontSize:9,color:C.cyan,letterSpacing:3,marginBottom:10 }}>MASTER</div>
+            <div style={{ display:"flex",alignItems:"center",gap:10 }}>
+              <div style={{ flex:1 }}>
+                <NeonSlider value={masterVol} color={C.cyan} onChange={setMasterVol}/>
+              </div>
+              <VUMeter trackId="__master__" active={isPlaying} color={C.cyan}/>
+            </div>
+            <div style={{ marginTop:8,display:"flex",gap:4 }}>
+              <CyberButton small active>MONO</CyberButton>
+              <CyberButton small>STEREO</CyberButton>
+            </div>
+          </div>
+
+          {/* Engine status */}
+          <div style={{ padding:"12px 14px",borderBottom:`1px solid ${C.border}` }}>
+            <div style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3,marginBottom:8 }}>ENGINE STATUS</div>
+            {[
+              ["WAVESURFER 7", libsReady, "WAVEFORM"],
+              ["TONE.JS 14",   libsReady, "PLAYBACK"],
+              ["WEB AUDIO",    libsReady, "CONTEXT"],
+              ["ONNX RT",      false,     "STEM AI"],
+            ].map(([name,ok,desc]) => (
+              <div key={name} style={{ display:"flex",alignItems:"center",gap:6,marginBottom:5 }}>
+                <div style={{ width:5,height:5,borderRadius:"50%",flexShrink:0,
+                  background: ok ? C.cyan : C.border,
+                  boxShadow:  ok ? `0 0 6px ${C.cyan}` : "none" }}/>
+                <span style={{ fontSize:8,fontFamily:"monospace",color: ok ? C.cyan : C.textDim }}>{name}</span>
+                <span style={{ fontSize:7,fontFamily:"monospace",color:C.textDim,marginLeft:"auto" }}>{desc}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Keyboard shortcuts */}
+          <div style={{ padding:"12px 14px",borderBottom:`1px solid ${C.border}` }}>
+            <div style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3,marginBottom:8 }}>SHORTCUTS</div>
+            {[["SPACE","PLAY / PAUSE"],["ESC","STOP + REWIND"],["C","CUT TOOL"],
+              ["V","SELECT"],["D","DRAW"],["CTRL+Z","UNDO"]].map(([k,v]) => (
+              <div key={k} style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5 }}>
+                <span style={{ fontSize:8,color:C.cyan,background:`rgba(0,243,255,0.07)`,padding:"1px 6px",letterSpacing:1 }}>{k}</span>
+                <span style={{ fontSize:8,color:C.textDim }}>{v}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Stem status */}
+          <div style={{ padding:"12px 14px" }}>
+            <div style={{ fontFamily:"monospace",fontSize:9,color:C.textDim,letterSpacing:3,marginBottom:8 }}>STEM STATUS</div>
+            {[["VOCALS",C.cyan],["BASS",C.purple],["DRUMS",C.pink],["MELODY",C.yellow]].map(([s,c]) => (
+              <div key={s} style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6 }}>
+                <StemBadge label={s} color={c}/>
+                <span style={{ fontSize:7,color:C.textDim }}>IDLE</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Footer */}
+          <div style={{ marginTop:"auto",padding:"10px 14px",borderTop:`1px solid ${C.border}` }}>
+            <div style={{ fontFamily:"monospace",fontSize:7,color:C.textDim,letterSpacing:2 }}>ALONE AUDIO STUDIO</div>
+            <div style={{ fontFamily:"monospace",fontSize:7,color:C.textDim,letterSpacing:2 }}>v2.0.0 · CLIENT-SIDE</div>
+            <div style={{ fontFamily:"monospace",fontSize:7,color:C.cyanDim,letterSpacing:2,marginTop:2 }}>
+              WAVESURFER + TONE.JS
+            </div>
+          </div>
+        </motion.div>
+      </div>
+
+      {/* ── MODALS ───────────────────────────────────────────────────── */}
+      <AnimatePresence>
+        {showEQ && eqTrack && (
+          <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+            style={{ position:"fixed",inset:0,zIndex:60,display:"flex",alignItems:"flex-end",
+                     justifyContent:"center",paddingBottom:56,background:"rgba(0,0,0,0.7)" }}
+            onClick={e => { if (e.target===e.currentTarget) setShowEQ(false); }}>
+            <EQPanel
+              trackId={eqTrack.id} trackName={eqTrack.name}
+              gains={eqTrack.eq}
+              onGainChange={(i,v) => updateEQ(eqTrack.id, i, v)}
+              onClose={() => setShowEQ(false)}/>
+          </motion.div>
+        )}
+
+        {showStem && (
+          <motion.div initial={{ opacity:0 }} animate={{ opacity:1 }} exit={{ opacity:0 }}
+            style={{ position:"fixed",inset:0,zIndex:60,display:"flex",alignItems:"center",
+                     justifyContent:"center",background:"rgba(0,0,0,0.75)" }}
+            onClick={e => { if (e.target===e.currentTarget) setShowStem(false); }}>
+            <StemPanel onClose={() => setShowStem(false)} onProcess={handleStemDone}/>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Global styles ────────────────────────────────────────────── */}
+      <style>{`
+        * { box-sizing: border-box; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.15} }
+        ::-webkit-scrollbar { width:5px; height:5px; }
+        ::-webkit-scrollbar-track { background:${C.bg}; }
+        ::-webkit-scrollbar-thumb { background:${C.border}; border-radius:2px; }
+        ::-webkit-scrollbar-thumb:hover { background:${C.cyanDim}; }
+        input[type=range]::-webkit-slider-thumb {
+          -webkit-appearance:none; width:12px; height:12px;
+          border-radius:2px; background:${C.cyan};
+          cursor:pointer; box-shadow:0 0 6px ${C.cyan};
+        }
+        input[type=number]::-webkit-inner-spin-button,
+        input[type=number]::-webkit-outer-spin-button { opacity:0.25; }
+        /* WaveSurfer internal canvas bg fix */
+        wave { background: transparent !important; }
+      `}</style>
+    </div>
+  );
+}
